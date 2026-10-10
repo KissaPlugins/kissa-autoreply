@@ -1,6 +1,11 @@
+
 import os
 import asyncio
 import logging
+import json
+import urllib.request
+import urllib.error
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -9,12 +14,54 @@ logging.basicConfig(level=logging.INFO)
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
     API_HASH,
 )
+
+async def ask_ai(message):
+    def request_ai():
+        payload = {
+            "model": "openrouter/free",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты помощник владельца Telegram-аккаунта. "
+                        "Отвечай естественно, кратко и дружелюбно "
+                        "на языке собеседника. Не выдумывай факты "
+                        "о владельце. Если не знаешь ответа, честно "
+                        "скажи об этом. Не обещай действий от имени "
+                        "владельца и не запрашивай пароли или коды."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+        }
+
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        return result["choices"][0]["message"]["content"].strip()
+
+    try:
+        return await asyncio.to_thread(request_ai)
+    except Exception:
+        logging.exception("Ошибка запроса к ИИ")
+        return "Спасибо за сообщение! Я отвечу тебе немного позже."
 
 @client.on(events.NewMessage(incoming=True))
 async def auto_reply(event):
@@ -29,19 +76,13 @@ async def auto_reply(event):
     if not message:
         return
 
-    await event.reply("Увидел сообщение, отвечу чуть позже.")
+    reply = await ask_ai(message)
+    await event.reply(reply)
 
 async def main():
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        logging.error("Сессия недействительна. Нужно создать новую.")
-        return
-
-    logging.info("Kissa AutoReply запущен")
+    await client.start()
+    logging.info("Kissa AI AutoReply запущен")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
