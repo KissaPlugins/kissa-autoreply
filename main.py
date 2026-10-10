@@ -1,27 +1,20 @@
-
 import os
 import asyncio
 import logging
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-SESSION_STRING = os.environ.get("TG_SESSION", "")
+SESSION_STRING = os.environ["TG_SESSION"]
 
 client = TelegramClient(
-    "kissa_autoreply",
+    StringSession(SESSION_STRING),
     API_ID,
     API_HASH,
 )
-
-# Не отвечаем на сообщения, отправленные самим аккаунтом.
-# Не отвечаем в группах и каналах.
-# Здесь пока используется простой шаблон, без внешнего ИИ.
 
 @client.on(events.NewMessage(incoming=True))
 async def auto_reply(event):
@@ -36,33 +29,19 @@ async def auto_reply(event):
     if not message:
         return
 
-    logging.info("Новое личное сообщение получено")
-
-    # Простой стартовый вариант: ответ только на первое
-    # входящее сообщение в диалоге после запуска.
-    # Вместо шаблона позднее подключим генерацию ИИ.
-    reply = "увидел, отвечу чуть позже"
-
-    try:
-        await event.reply(reply)
-    except Exception:
-        logging.exception("Не удалось отправить ответ")
-
+    await event.reply("Увидел сообщение, отвечу чуть позже.")
 
 async def main():
-    if SESSION_STRING:
-        from telethon.sessions import StringSession
-        global client
-        client = TelegramClient(
-            StringSession(SESSION_STRING),
-            API_ID,
-            API_HASH,
-        )
+    await client.connect()
 
-    await client.start()
+    if not await client.is_user_authorized():
+        logging.error("Сессия недействительна. Нужно создать новую.")
+        return
+
     logging.info("Kissa AutoReply запущен")
     await client.run_until_disconnected()
 
-
 if __name__ == "__main__":
     asyncio.run(main())
+
+
