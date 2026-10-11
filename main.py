@@ -69,8 +69,8 @@ POLL_SECONDS = 60
 
 # Медиа
 MAX_MEDIA_BYTES = 18 * 1024 * 1024
-MAX_VIDEO_FRAMES = 3
-MAX_IMAGE_SIDE = 960
+MAX_VIDEO_FRAMES = 6
+MAX_IMAGE_SIDE = 2048
 
 logging.basicConfig(
     level=logging.INFO,
