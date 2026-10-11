@@ -877,43 +877,40 @@ async def openrouter_request(
             "OpenRouter response: %s",
             str(data)[:2500],
         )
-choices = data.get("choices") or []
+    choices = data.get("choices") or []
 
-if not choices:
-    log.error(
-        "OpenRouter: нет choices. Ответ API: %s",
-        str(data)[:2000],
-    )
-    raise RuntimeError(
-        "OpenRouter не вернул choices"
-    )
+    if not choices:
+        log.error(
+            "OpenRouter: нет choices. Ответ API: %s",
+            str(data)[:2000],
+        )
+        raise RuntimeError("OpenRouter не вернул choices")
 
-message_data = choices[0].get("message") or {}
-content = message_data.get("content", "")
+    message_data = choices[0].get("message") or {}
+    content = message_data.get("content", "")
 
-if isinstance(content, list):
-    text_parts = []
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+        content = "\n".join(text_parts)
 
-    for part in content:
-        if isinstance(part, dict) and part.get("type") == "text":
-            text_parts.append(part.get("text", ""))
+    if not isinstance(content, str):
+        content = str(content) if content is not None else ""
 
-    content = "\n".join(text_parts)
+    content = content.strip()
 
-if not isinstance(content, str):
-    content = str(content) if content is not None else ""
+    if not content:
+        log.warning(
+            "Пустой ответ OpenRouter. Модель: %s. Choice: %s",
+            data.get("model"),
+            str(choices[0])[:2000],
+        )
+        return ""
 
-content = content.strip()
+    return content
 
-if not content:
-    log.warning(
-        "Пустой ответ OpenRouter. Модель: %s. Choice: %s",
-        data.get("model"),
-        str(choices[0])[:2000],
-    )
-    return ""
-
-return content
 
 
     # Некоторые мультимодальные модели возвращают
