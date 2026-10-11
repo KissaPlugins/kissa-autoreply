@@ -770,6 +770,7 @@ SYSTEM_PROMPT = (
 )
 
 
+
 async def build_context(chat_id, current_text=None):
     async with db_lock:
         rows = db.execute(
@@ -780,10 +781,7 @@ async def build_context(chat_id, current_text=None):
             ORDER BY message_id DESC
             LIMIT ?
             """,
-            (
-                chat_id,
-                RECENT_CONTEXT_LIMIT,
-            ),
+            (chat_id, RECENT_CONTEXT_LIMIT),
         ).fetchall()
 
     rows = list(reversed(rows))
@@ -791,27 +789,33 @@ async def build_context(chat_id, current_text=None):
     history = []
 
     for row in rows:
-        role = (
-            "assistant"
-            if row["outgoing"]
-            else "user"
-        )
+        role = "assistant" if row["outgoing"] else "user"
+        text = (row["text"] or "").strip()
 
-        history.append({
-            "role": role,
-            "content": row["text"][:1800],
-        })
+        if not text:
+            continue
+
+        # Объединяем подряд идущие сообщения одной роли.
+        if history and history[-1]["role"] == role:
+            history[-1]["content"] += "\n" + text[:1800]
+        else:
+            history.append({
+                "role": role,
+                "content": text[:1800],
+            })
 
     if current_text is not None:
-        if (
-            not history
-            or history[-1]["role"] != "user"
-            or history[-1]["content"] != current_text
-        ):
-            history.append({
-                "role": "user",
-                "content": current_text[:1800],
-            })
+        current_text = str(current_text).strip()
+
+        if current_text:
+            if history and history[-1]["role"] == "user":
+                if history[-1]["content"] != current_text:
+                    history[-1]["content"] += "\n" + current_text[:1800]
+            else:
+                history.append({
+                    "role": "user",
+                    "content": current_text[:1800],
+                })
 
     return [
         {
