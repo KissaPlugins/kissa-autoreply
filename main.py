@@ -352,50 +352,44 @@ async def generate_reply(chat_id, incoming_text):
     if not recent or recent[-1]["sender"] != "user" or recent[-1]["text"] != incoming_text:
         messages.append({"role": "user", "content": incoming_text})
 
-    answer = await openrouter_request(messages, max_tokens=60)
-    # Первый фильтр: подозрительный текст не отправляется.
-    if not looks_like_reasoning(answer):
-        return answer[:2500].strip()
+    try:
+        answer = await openrouter_request(messages, max_tokens=60)
+        if not looks_like_reasoning(answer):
+            return answer[:2500].strip()
 
-    log.warning("Ответ модели похож на рассуждения. Повторный запрос.")
+        log.warning("Подозрительный ответ модели. Повторный запрос.")
 
-    retry_messages = [
-        {
-            "role": "system",
-            "content": (
-                "Верни только одно короткое готовое сообщение для Telegram. "
-                "Не выводи анализ, объяснения или ход мыслей."
-            )
-        },
-        {
-            "role": "user",
-            "content": (
-                "Ответь естественно на последнее сообщение. Контекст:\n"
-                + "\n".join(
-                    f'{r["sender"]}: {r["text"]}'
-                    for r in recent[-12:]
+        retry_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Напиши только короткий готовый ответ для Telegram. "
+                    "Не показывай анализ, рассуждения или пояснения."
                 )
-                + "\nПоследнее сообщение: " + incoming_text
-            )
-        }
-    ]
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Контекст переписки:\n"
+                    + "\n".join(
+                        f'{r["sender"]}: {r["text"]}'
+                        for r in recent[-12:]
+                    )
+                    + "\nПоследнее сообщение: " + incoming_text
+                )
+            }
+        ]
 
-   retry = await openrouter_request(retry_messages, max_tokens=60)
+        retry = await openrouter_request(retry_messages, max_tokens=60)
+        if not looks_like_reasoning(retry):
+            return retry[:2500].strip()
 
-    if not looks_like_reasoning(retry):
-        return retry[:2500].strip()
+        log.error("Повторный ответ тоже похож на рассуждения.")
+        return "ок"
 
-    log.error("Модель снова вернула подозрительный текст; не отправляю его.")
-    return "Понял."
-
-client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
-chat_locks = {}
-
-async def handle_incoming(event):
-    chat_id = event.chat_id
-    if not chat_id or not event.is_private:
-        return
-
+    except Exception:
+        log.exception("Ошибка генерации ответа")
+        return "ок"
     sender = await event.get_sender()
     username = getattr(sender, "username", None)
 
