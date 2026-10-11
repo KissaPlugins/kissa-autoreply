@@ -965,9 +965,10 @@ async def handle_incoming(event):
         )
         return
 
-content, stored_text = await prepare_incoming_content(
-    message
-)
+
+    content, stored_text = await prepare_incoming_content(
+        message
+    )
 
 if content is None:
     log.info(
