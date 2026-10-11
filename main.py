@@ -532,20 +532,41 @@ def resize_and_encode_frame(frame):
     return "data:image/jpeg;base64," + encoded_base64
 
 
+
 async def photo_to_content(message):
     data = await download_media_bytes(message)
 
     if not data:
         return None
 
-    encoded = base64.b64encode(data).decode("ascii")
+    try:
+        import numpy as np
 
-    return {
-        "type": "image_url",
-        "image_url": {
-            "url": "data:image/jpeg;base64," + encoded
-        },
-    }
+        image_array = np.frombuffer(data, dtype=np.uint8)
+        frame = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
+
+        if frame is None:
+            log.warning("Не удалось прочитать изображение")
+            return None
+
+        image_url = resize_and_encode_frame(frame)
+
+        if not image_url:
+            return None
+
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": image_url,
+            },
+        }
+
+    except Exception:
+        log.exception("Ошибка обработки фотографии")
+        return None
 
 
 async def video_to_content(message):
@@ -558,10 +579,21 @@ async def video_to_content(message):
     cap = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp4",
-            delete=False,
-        ) as temp_file:
+       video_name = (
+    getattr(message.file, "name", None) or ""
+).lower()
+
+video_suffix = os.path.splitext(video_name)[1]
+
+if video_suffix not in (
+    ".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"
+):
+    video_suffix = ".mp4"
+
+with tempfile.NamedTemporaryFile(
+    suffix=video_suffix,
+    delete=False,
+) as temp_file:
             temp_file.write(data)
             temp_path = temp_file.name
 
