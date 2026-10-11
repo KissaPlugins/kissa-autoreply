@@ -965,16 +965,20 @@ async def handle_incoming(event):
         )
         return
 
-    content, stored_text = await prepare_incoming_content(
-        message
-    )
+content, stored_text = await prepare_incoming_content(
+    message
+)
 
-    if content is None:
-        log.info(
-            "Пропущено неподдерживаемое медиа в чате %s",
-            chat_id,
-        )
-        return
+if content is None:
+    log.info(
+        "Пропущено неподдерживаемое медиа в чате %s",
+        chat_id,
+    )
+    return
+
+if isinstance(content, str) and not content.strip():
+    return
+
 
     lock = get_chat_lock(chat_id)
 
