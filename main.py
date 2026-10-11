@@ -303,12 +303,14 @@ async def openrouter_request(messages, max_tokens=120):
         "HTTP-Referer": "https://github.com/KissaPlugins/kissa-autoreply",
         "X-Title": "Kissa AI AutoReply",
     }
-  payload = {
-    "model": MODEL,
-    "messages": messages,
-    "temperature": 0.4,
-    "max_tokens": max_tokens,
-}
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.4,
+        "max_tokens": max_tokens,
+    }
+
+
     async with httpx.AsyncClient(timeout=45) as http:
         response = await http.post(
             "https://openrouter.ai/api/v1/chat/completions",
