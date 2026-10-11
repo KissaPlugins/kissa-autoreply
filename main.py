@@ -569,6 +569,7 @@ async def photo_to_content(message):
         return None
 
 
+
 async def video_to_content(message):
     data = await download_media_bytes(message)
 
@@ -579,21 +580,21 @@ async def video_to_content(message):
     cap = None
 
     try:
-       video_name = (
-    getattr(message.file, "name", None) or ""
-).lower()
+        video_name = (
+            getattr(message.file, "name", None) or ""
+        ).lower()
 
-video_suffix = os.path.splitext(video_name)[1]
+        video_suffix = os.path.splitext(video_name)[1]
 
-if video_suffix not in (
-    ".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"
-):
-    video_suffix = ".mp4"
+        if video_suffix not in (
+            ".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"
+        ):
+            video_suffix = ".mp4"
 
-with tempfile.NamedTemporaryFile(
-    suffix=video_suffix,
-    delete=False,
-) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            suffix=video_suffix,
+            delete=False,
+        ) as temp_file:
             temp_file.write(data)
             temp_path = temp_file.name
 
