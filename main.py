@@ -699,8 +699,8 @@ async def handle_incoming(event):
     sender = await event.get_sender()
     username = getattr(sender, "username", None)
 
-    if not allowed_chat(chat_id, username):
-        return
+    # Ограничение KISSA_ALLOWED_CHATS отключено:
+    # отвечаем всем личным чатам.
 
     if quiet_hours():
         log.info("Тихие часы: чат %s пропущен", chat_id)
