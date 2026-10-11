@@ -558,7 +558,12 @@ SYSTEM_PROMPT = (
     "Пиши по-русски, если собеседник пишет по-русски. "
     "Обычно отвечай одной короткой фразой, спокойно и без эмодзи. "
     "Не говори, что ты ИИ, бот или модель. "
-    "Верни только текст сообщения, без кавычек и пояснений."
+    "Верни только текст сообщения, без кавычек и пояснений. "
+    "Не повторяй дословно недавние ответы и не используй шаблонные "
+    "реакции вроде «Хахаха, точно!» без причины. "
+    "Если на фото или видео несколько объектов, описывай только то, "
+    "что действительно видно, и связывай ответ с текстом собеседника. "
+    "Не приписывай изображению случайных персонажей или события. "
     "Не пытайся угадывать значение подросткового сленга, "
     "намеренно искажённых слов, непонятных сокращений и опечаток. "
     "Если смысл сообщения неясен, не додумывай его и не отвечай "
@@ -757,6 +762,23 @@ async def handle_incoming(event):
                 log.warning("Пустой ответ для чата %s; сообщение не отправлено", chat_id)
                 return
 
+            # Защита от повторов: не отправляем точную копию недавнего ответа.
+            normalized_answer = " ".join(answer.lower().split()).strip(" .!?…\"'«»")
+            recent_outgoing = [
+                " ".join(str(item.get("content", "")).lower().split()).strip(" .!?…\"'«»")
+                for item in messages
+                if item.get("role") == "assistant" and isinstance(item.get("content"), str)
+            ][-8:]
+            if normalized_answer and normalized_answer in recent_outgoing:
+                log.info("Повтор ответа предотвращён в чате %s", chat_id)
+                messages.append({
+                    "role": "user",
+                    "content": "Сформулируй другой короткий ответ на последнее сообщение. Не повторяй предыдущие ответы.",
+                })
+                answer = await openrouter_request(messages)
+                if not answer:
+                    return
+
             sent = await event.respond(answer[:MAX_MESSAGE_CHARS])
 
             if sent:
@@ -794,7 +816,28 @@ async def on_outgoing(event):
     if not event.is_private or not event.chat_id:
         return
 
-    if not (event.raw_text or "").strip():
+    text = (event.raw_text or "").strip()
+    if not text:
+        return
+
+    # Команды владельца: ответы видны только в личном чате, где введена команда.
+    command = text.split()[0].lower()
+    if command in ("/status", "/status@kissa_autoreply_bot"):
+        async with db_lock:
+            row = db.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?",
+                (int(event.chat_id),),
+            ).fetchone()
+        status = (
+            "Kissa AI AutoReply — статус\n"
+            f"Модель: {MODEL}\n"
+            f"Тихие часы сейчас: {'да' if quiet_hours() else 'нет'}\n"
+            f"Продолжение переписки: {'включено' if FOLLOWUP_ENABLED else 'выключено'}\n"
+            f"Сообщений в памяти этого чата: {row['n'] if row else 0}\n"
+            "Ответы: все личные чаты (если медиа поддерживается)."
+        )
+        await event.respond(status)
+        log.info("Команда /status выполнена в чате %s", event.chat_id)
         return
 
     await save_message_async(event.chat_id, event.message, outgoing=True)
@@ -824,9 +867,6 @@ async def followup_loop():
 
                 for row in rows:
                     chat_id = int(row["chat_id"])
-                    if not allowed_chat(chat_id):
-                        continue
-
                     incoming = parse_dt(row["last_incoming_at"])
                     outgoing = parse_dt(row["last_outgoing_at"])
                     last_followup = parse_dt(row["last_followup_at"])
@@ -963,7 +1003,7 @@ async def main():
 
     log.info("Запуск Kissa AI AutoReply")
     log.info("Модель OpenRouter: %s", MODEL)
-    log.info("Разрешённых адресатов: %s", len(ALLOWED_CHATS))
+    log.info("Автоответы: все личные чаты; список KISSA_ALLOWED_CHATS для входящих не применяется")
 
     await client.start()
     me = await client.get_me()
