@@ -1,2 +1,4 @@
-telethon==1.45.0
-httpx>=0.27.0
+
+telethon
+httpx
+opencv-python-headless
