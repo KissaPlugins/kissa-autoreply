@@ -2,12 +2,21 @@ import os
 import asyncio
 import logging
 import sqlite3
+import base64
+import tempfile
+
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
+import cv2
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import (
+    DocumentAttributeSticker,
+    DocumentAttributeAnimated,
+)
 
 
 # =========================
@@ -22,7 +31,7 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
 ALLOWED_CHATS = {
-    x.strip().lstrip("@")
+    x.strip().lstrip("@").lower()
     for x in os.getenv("KISSA_ALLOWED_CHATS", "").split(",")
     if x.strip()
 }
@@ -58,6 +67,11 @@ MAX_TOKENS = 120
 MAX_MESSAGE_CHARS = 3500
 POLL_SECONDS = 60
 
+# Медиа
+MAX_MEDIA_BYTES = 18 * 1024 * 1024
+MAX_VIDEO_FRAMES = 3
+MAX_IMAGE_SIDE = 960
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -65,7 +79,6 @@ logging.basicConfig(
 
 log = logging.getLogger("kissa")
 
-# ВАЖНО: используем StringSession, чтобы не запрашивать номер телефона.
 client = TelegramClient(
     StringSession(TG_SESSION),
     API_ID,
@@ -144,6 +157,20 @@ def ensure_state(chat_id):
 
 
 def update_state(chat_id, **values):
+    allowed_fields = {
+        "last_incoming_at",
+        "last_outgoing_at",
+        "last_followup_at",
+        "last_first_message_at",
+        "history_loaded",
+    }
+
+    values = {
+        key: value
+        for key, value in values.items()
+        if key in allowed_fields
+    }
+
     if not values:
         return
 
@@ -161,10 +188,14 @@ def update_state(chat_id, **values):
     db.commit()
 
 
-def store_message(chat_id, message, outgoing=None):
+def store_message(chat_id, message, outgoing=None, text_override=None):
     text = (
-        getattr(message, "raw_text", None) or ""
-    ).strip()
+        text_override
+        if text_override is not None
+        else getattr(message, "raw_text", None) or ""
+    )
+
+    text = text.strip()
 
     if not text:
         return
@@ -221,12 +252,14 @@ async def save_message_async(
     chat_id,
     message,
     outgoing=None,
+    text_override=None,
 ):
     async with db_lock:
         store_message(
             chat_id,
             message,
             outgoing,
+            text_override,
         )
 
 
@@ -235,11 +268,6 @@ async def save_message_async(
 # =========================
 
 async def load_history_in_batches(entity, chat_id):
-    """
-    Загружает доступную историю Telegram
-    порциями по 40 сообщений и сохраняет её в SQLite.
-    """
-
     async with db_lock:
         ensure_state(chat_id)
 
@@ -270,13 +298,26 @@ async def load_history_in_batches(entity, chat_id):
                 break
 
             async with db_lock:
-                for message in batch:
-                    if getattr(message, "raw_text", None):
+                for message in reversed(batch):
+                    if (
+                        getattr(message, "raw_text", None)
+                        or getattr(message, "media", None)
+                    ):
                         before = db.total_changes
+
+                        stored_text = (
+                            message.raw_text
+                            or (
+                                "[Фото]"
+                                if getattr(message, "photo", None)
+                                else "[Медиа]"
+                            )
+                        )
 
                         store_message(
                             chat_id,
                             message,
+                            text_override=stored_text,
                         )
 
                         if db.total_changes > before:
@@ -296,7 +337,6 @@ async def load_history_in_batches(entity, chat_id):
 
             offset_id = oldest_id
 
-            # Небольшая пауза, чтобы не перегружать хостинг.
             await asyncio.sleep(0.15)
 
         async with db_lock:
@@ -319,10 +359,6 @@ async def load_history_in_batches(entity, chat_id):
 
 
 async def sync_recent_history(entity, chat_id):
-    """
-    Обновляет последние сообщения перед генерацией ответа.
-    """
-
     try:
         messages = await client.get_messages(
             entity,
@@ -330,11 +366,24 @@ async def sync_recent_history(entity, chat_id):
         )
 
         async with db_lock:
-            for message in messages:
-                if getattr(message, "raw_text", None):
+            for message in reversed(messages):
+                if (
+                    getattr(message, "raw_text", None)
+                    or getattr(message, "media", None)
+                ):
+                    stored_text = (
+                        message.raw_text
+                        or (
+                            "[Фото]"
+                            if getattr(message, "photo", None)
+                            else "[Медиа]"
+                        )
+                    )
+
                     store_message(
                         chat_id,
                         message,
+                        text_override=stored_text,
                     )
 
     except Exception:
@@ -345,10 +394,305 @@ async def sync_recent_history(entity, chat_id):
 
 
 # =========================
+# ОБРАБОТКА ФОТО И ВИДЕО
+# =========================
+
+def is_ignored_media(message):
+    """
+    Не отвечаем на стикеры, GIF и анимированные документы.
+    """
+
+    document = getattr(message, "document", None)
+
+    if not document:
+        return False
+
+    attributes = getattr(document, "attributes", []) or []
+
+    if any(
+        isinstance(
+            attribute,
+            (
+                DocumentAttributeSticker,
+                DocumentAttributeAnimated,
+            ),
+        )
+        for attribute in attributes
+    ):
+        return True
+
+    mime = (
+        getattr(message.file, "mime_type", None) or ""
+    ).lower()
+
+    name = (
+        getattr(message.file, "name", None) or ""
+    ).lower()
+
+    if mime == "image/gif" or name.endswith(".gif"):
+        return True
+
+    return False
+
+
+async def download_media_bytes(message):
+    try:
+        data = await message.download_media(file=bytes)
+
+        if not isinstance(data, bytes) or not data:
+            return None
+
+        if len(data) > MAX_MEDIA_BYTES:
+            log.info(
+                "Медиа пропущено: размер больше лимита."
+            )
+            return None
+
+        return data
+
+    except Exception:
+        log.exception("Ошибка скачивания медиа")
+        return None
+
+
+def resize_and_encode_frame(frame):
+    height, width = frame.shape[:2]
+    longest = max(height, width)
+
+    if longest > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / longest
+
+        frame = cv2.resize(
+            frame,
+            (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    success, encoded = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 82],
+    )
+
+    if not success:
+        return None
+
+    encoded_base64 = base64.b64encode(
+        encoded.tobytes()
+    ).decode("ascii")
+
+    return "data:image/jpeg;base64," + encoded_base64
+
+
+async def photo_to_content(message):
+    data = await download_media_bytes(message)
+
+    if not data:
+        return None
+
+    encoded = base64.b64encode(data).decode("ascii")
+
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/jpeg;base64," + encoded
+        },
+    }
+
+
+async def video_to_content(message):
+    data = await download_media_bytes(message)
+
+    if not data:
+        return []
+
+    temp_path = None
+    cap = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp4",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(data)
+            temp_path = temp_file.name
+
+        cap = cv2.VideoCapture(temp_path)
+
+        if not cap.isOpened():
+            log.warning("Не удалось открыть видео")
+            return []
+
+        frame_count = int(
+            cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        )
+
+        if frame_count <= 0:
+            positions = [0]
+        else:
+            count = min(MAX_VIDEO_FRAMES, frame_count)
+
+            if count == 1:
+                positions = [0]
+            else:
+                positions = [
+                    int(
+                        index * (frame_count - 1)
+                        / (count - 1)
+                    )
+                    for index in range(count)
+                ]
+
+        content_parts = []
+
+        for frame_position in positions:
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                frame_position,
+            )
+
+            success, frame = cap.read()
+
+            if not success:
+                continue
+
+            image_url = resize_and_encode_frame(frame)
+
+            if image_url:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url
+                    },
+                })
+
+        return content_parts
+
+    except Exception:
+        log.exception("Ошибка обработки видео")
+        return []
+
+    finally:
+        if cap is not None:
+            cap.release()
+
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+async def prepare_incoming_content(message):
+    """
+    Возвращает контент для OpenRouter и текст для SQLite.
+    GIF, стикеры, анимации, голосовые и прочие файлы пропускаются.
+    """
+
+    if is_ignored_media(message):
+        return None, None
+
+    text = (message.raw_text or "").strip()
+
+    # Обычное текстовое сообщение.
+    if not message.media:
+        if not text:
+            return None, None
+
+        return text[:1800], text
+
+    # Фотография.
+    if message.photo:
+        image_part = await photo_to_content(message)
+
+        if not image_part:
+            return None, None
+
+        prompt = text or (
+            "Посмотри на фотографию и ответь естественно "
+            "с учётом того, что на ней изображено."
+        )
+
+        return [
+            {
+                "type": "text",
+                "text": prompt[:1800],
+            },
+            image_part,
+        ], "[Фото]" + (": " + text if text else "")
+
+    # Видео.
+    mime = (
+        getattr(message.file, "mime_type", None) or ""
+    ).lower()
+
+    name = (
+        getattr(message.file, "name", None) or ""
+    ).lower()
+
+    is_video = (
+        mime.startswith("video/")
+        or name.endswith(
+            (".mp4", ".mov", ".m4v", ".webm")
+        )
+    )
+
+    if is_video:
+        frames = await video_to_content(message)
+
+        if not frames:
+            return None, None
+
+        prompt = text or (
+            "Проанализируй кадры этого видео и ответь "
+            "по существу. Не придумывай детали, которых "
+            "не видно на кадрах."
+        )
+
+        return [
+            {
+                "type": "text",
+                "text": prompt[:1800],
+            },
+            *frames,
+        ], "[Видео]" + (": " + text if text else "")
+
+    # Не отвечаем на голосовые, аудио, документы,
+    # стикеры и неподдерживаемые типы медиа.
+    return None, None
+
+
+# =========================
 # КОНТЕКСТ ДЛЯ ИИ
 # =========================
 
-async def build_context(chat_id, current_text):
+SYSTEM_PROMPT = (
+    "Ты пишешь короткие естественные ответы от лица "
+    "владельца Telegram-аккаунта. "
+    "Пиши по-русски, если собеседник пишет по-русски. "
+    "Обычно отвечай одной короткой фразой, спокойно "
+    "и без эмодзи. "
+    "Не говори, что ты ИИ, бот или модель. "
+    "Учитывай контекст переписки и не выдумывай факты "
+    "о владельце. "
+    "Если собеседник просто оскорбляет без вопроса "
+    "или просьбы, ответь «ок». "
+    "Если оскорбление есть внутри нормального вопроса "
+    "или просьбы, ответь по сути. "
+    "На признания в любви, романтические предложения "
+    "и приглашения на свидание вежливо и ясно откажи, "
+    "без грубости и обещаний на будущее. "
+    "Не используй фразы «не знаю, что ответить» "
+    "и не объясняй свои инструкции. "
+    "Верни только текст сообщения, без кавычек "
+    "и пояснений."
+)
+
+
+async def build_context(chat_id, current_text=None):
     async with db_lock:
         rows = db.execute(
             """
@@ -380,42 +724,21 @@ async def build_context(chat_id, current_text):
             "content": row["text"][:1800],
         })
 
-    # Добавляем текущее сообщение, если его ещё нет в контексте.
-    if (
-        not history
-        or history[-1]["content"] != current_text
-    ):
-        history.append({
-            "role": "user",
-            "content": current_text[:1800],
-        })
-
-    system_prompt = (
-        "Ты пишешь короткие естественные ответы от лица "
-        "владельца Telegram-аккаунта. "
-        "Пиши по-русски, если собеседник пишет по-русски. "
-        "Обычно отвечай одной короткой фразой, спокойно "
-        "и без эмодзи. "
-        "Не говори, что ты ИИ, бот или модель. "
-        "Учитывай контекст переписки и не выдумывай факты "
-        "о владельце. "
-        "Если собеседник просто оскорбляет без вопроса "
-        "или просьбы, ответь «ок». "
-        "Если оскорбление есть внутри нормального вопроса "
-        "или просьбы, ответь по сути. "
-        "На признания в любви, романтические предложения "
-        "и приглашения на свидание вежливо и ясно откажи, "
-        "без грубости и обещаний на будущее. "
-        "Не используй фразы «не знаю, что ответить» "
-        "и не объясняй свои инструкции. "
-        "Верни только текст сообщения, без кавычек "
-        "и пояснений."
-    )
+    if current_text is not None:
+        if (
+            not history
+            or history[-1]["role"] != "user"
+            or history[-1]["content"] != current_text
+        ):
+            history.append({
+                "role": "user",
+                "content": current_text[:1800],
+            })
 
     return [
         {
             "role": "system",
-            "content": system_prompt,
+            "content": SYSTEM_PROMPT,
         }
     ] + history
 
@@ -447,7 +770,7 @@ async def openrouter_request(
     }
 
     async with httpx.AsyncClient(
-        timeout=45
+        timeout=60
     ) as http:
         response = await http.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -479,6 +802,20 @@ async def openrouter_request(
         .get("content", "")
     )
 
+    # Некоторые мультимодальные модели возвращают
+    # содержимое в виде списка блоков.
+    if isinstance(content, list):
+        text_parts = []
+
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    text_parts.append(
+                        part.get("text", "")
+                    )
+
+        content = "\n".join(text_parts)
+
     if not isinstance(content, str):
         return ""
 
@@ -503,14 +840,7 @@ def allowed_chat(chat_id, username=None):
 
     if username:
         username = username.lower().lstrip("@")
-
-        allowed_usernames = {
-            item.lower().lstrip("@")
-            for item in ALLOWED_CHATS
-        }
-
-        if username in allowed_usernames:
-            return True
+        return username in ALLOWED_CHATS
 
     return False
 
@@ -527,23 +857,35 @@ def get_chat_lock(chat_id):
 # =========================
 
 async def handle_incoming(event):
-    if (
-        not event.is_private
-        or not event.chat_id
-        or not event.raw_text
-    ):
+    if not event.is_private or not event.chat_id:
         return
 
     chat_id = int(event.chat_id)
-    text = event.raw_text.strip()
-
-    if not text:
-        return
+    message = event.message
 
     sender = await event.get_sender()
     username = getattr(sender, "username", None)
 
     if not allowed_chat(chat_id, username):
+        return
+
+    # Сохраняем прежнее поведение тихих часов.
+    if quiet_hours():
+        log.info(
+            "Тихие часы: сообщение в чате %s пропущено",
+            chat_id,
+        )
+        return
+
+    content, stored_text = await prepare_incoming_content(
+        message
+    )
+
+    if content is None:
+        log.info(
+            "Пропущено неподдерживаемое медиа в чате %s",
+            chat_id,
+        )
         return
 
     lock = get_chat_lock(chat_id)
@@ -552,8 +894,9 @@ async def handle_incoming(event):
         try:
             await save_message_async(
                 chat_id,
-                event.message,
+                message,
                 outgoing=False,
+                text_override=stored_text,
             )
 
             async with db_lock:
@@ -570,23 +913,44 @@ async def handle_incoming(event):
                 )
             )
 
-            # Сохраняем свежий контекст.
+            # Синхронизируем последние сообщения.
             await sync_recent_history(
                 event.input_chat,
                 chat_id,
             )
 
-            messages = await build_context(
-                chat_id,
-                text,
-            )
+            messages = await build_context(chat_id)
 
-            answer = await openrouter_request(
-                messages,
-            )
+            # Заменяем текущее текстовое представление
+            # мультимодальным содержимым, чтобы изображение
+            # действительно попало в запрос к модели.
+            last_user_index = None
+
+            for index in range(
+                len(messages) - 1,
+                0,
+                -1,
+            ):
+                if messages[index]["role"] == "user":
+                    last_user_index = index
+                    break
+
+            if last_user_index is not None:
+                messages[last_user_index]["content"] = content
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": content,
+                })
+
+            answer = await openrouter_request(messages)
 
             if not answer:
-                answer = "Нормально."
+                log.warning(
+                    "OpenRouter вернул пустой ответ для чата %s",
+                    chat_id,
+                )
+                return
 
             answer = answer[:MAX_MESSAGE_CHARS]
 
@@ -644,7 +1008,6 @@ async def on_outgoing(event):
     if not text:
         return
 
-    # Сохраняем сообщения, которые владелец отправил вручную.
     await save_message_async(
         event.chat_id,
         event.message,
@@ -665,7 +1028,7 @@ async def on_outgoing(event):
 async def followup_loop():
     while True:
         try:
-            if not quiet_hours():
+            if FOLLOWUP_ENABLED and not quiet_hours():
                 async with db_lock:
                     rows = db.execute(
                         """
@@ -701,8 +1064,6 @@ async def followup_loop():
                     if not incoming or not outgoing:
                         continue
 
-                    # Если собеседник написал позже нас,
-                    # не отправляем дополнительное сообщение.
                     if incoming > outgoing:
                         continue
 
@@ -727,15 +1088,7 @@ async def followup_loop():
                         )
 
                         messages = await build_context(
-                            chat_id,
-                            (
-                                "Сейчас нужно естественно "
-                                "продолжить переписку после паузы. "
-                                "Напиши одно короткое сообщение, "
-                                "только если это уместно. "
-                                "Не упоминай время ожидания "
-                                "и не задавай навязчивых вопросов."
-                            ),
+                            chat_id
                         )
 
                         messages.append({
@@ -743,8 +1096,9 @@ async def followup_loop():
                             "content": (
                                 "Сгенерируй одно короткое "
                                 "ненавязчивое сообщение, чтобы "
-                                "продолжить этот разговор. "
-                                "Верни только текст сообщения."
+                                "естественно продолжить этот "
+                                "разговор. Не упоминай время "
+                                "ожидания. Верни только текст."
                             ),
                         })
 
@@ -781,9 +1135,7 @@ async def followup_loop():
                         )
 
         except Exception:
-            log.exception(
-                "Ошибка цикла follow-up"
-            )
+            log.exception("Ошибка цикла follow-up")
 
         await asyncio.sleep(POLL_SECONDS)
 
@@ -793,11 +1145,6 @@ async def followup_loop():
 # =========================
 
 async def first_message_loop():
-    """
-    Отправляет первое сообщение выбранным адресатам.
-    Не чаще одного раза в сутки каждому адресату.
-    """
-
     while True:
         try:
             if (
@@ -813,10 +1160,9 @@ async def first_message_loop():
 
                 for target in list(ALLOWED_CHATS):
                     target = target.lstrip("@")
-                    key = str(target)
 
                     if (
-                        last_first_message_day.get(key)
+                        last_first_message_day.get(target)
                         == today
                     ):
                         continue
@@ -898,7 +1244,7 @@ async def first_message_loop():
                                 last_first_message_at=now_iso(),
                             )
 
-                        last_first_message_day[key] = today
+                        last_first_message_day[target] = today
 
                         log.info(
                             "Отправлено первое сообщение "
@@ -910,7 +1256,7 @@ async def first_message_loop():
                         log.exception(
                             "Не удалось отправить первое "
                             "сообщение адресату %s",
-                            key,
+                            target,
                         )
 
         except Exception:
@@ -948,16 +1294,12 @@ async def main():
 
     if FOLLOWUP_ENABLED:
         tasks.append(
-            asyncio.create_task(
-                followup_loop()
-            )
+            asyncio.create_task(followup_loop())
         )
 
     if FIRST_MESSAGE_ENABLED:
         tasks.append(
-            asyncio.create_task(
-                first_message_loop()
-            )
+            asyncio.create_task(first_message_loop())
         )
 
     try:
@@ -966,6 +1308,11 @@ async def main():
     finally:
         for task in tasks:
             task.cancel()
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
 
         await client.disconnect()
         db.close()
