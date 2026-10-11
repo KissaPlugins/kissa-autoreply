@@ -856,6 +856,7 @@ async def openrouter_request(
             json=payload,
         )
 
+
         if response.is_error:
             log.error(
                 "OpenRouter HTTP %s: %s",
@@ -865,7 +866,8 @@ async def openrouter_request(
 
             response.raise_for_status()
 
-               data = response.json()
+        data = response.json()
+
 
         log.info(
             "OpenRouter response: %s",
