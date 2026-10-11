@@ -842,8 +842,8 @@ async def handle_incoming(event):
                         answer = "Что ты имеешь в виду?"
 
             if is_generic_bad_reply(answer):
-            answer = "Извини, отвечу по сути, а не шаблоном."
-        sent = await event.respond(answer[:MAX_MESSAGE_CHARS])
+                answer = "Извини, отвечу по сути, а не шаблоном."
+            sent = await event.respond(answer[:MAX_MESSAGE_CHARS])
 
             if sent:
                 await save_message_async(chat_id, sent, outgoing=True)
