@@ -106,13 +106,35 @@ def init_db():
         CREATE TABLE IF NOT EXISTS messages (
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            sender TEXT NOT NULL,
-            text TEXT NOT NULL,
+            date TEXT NOT NULL DEFAULT '',
+            sender TEXT NOT NULL DEFAULT 'contact',
+            text TEXT NOT NULL DEFAULT '',
             outgoing INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (chat_id, message_id)
         )
     """)
+
+    # Миграция старой базы: добавляем отсутствующие столбцы.
+    columns = {
+        row["name"]
+        for row in db.execute(
+            "PRAGMA table_info(messages)"
+        ).fetchall()
+    }
+
+    required_columns = {
+        "date": "TEXT NOT NULL DEFAULT ''",
+        "sender": "TEXT NOT NULL DEFAULT 'contact'",
+        "text": "TEXT NOT NULL DEFAULT ''",
+        "outgoing": "INTEGER NOT NULL DEFAULT 0",
+    }
+
+    for column, definition in required_columns.items():
+        if column not in columns:
+            db.execute(
+                f"ALTER TABLE messages ADD COLUMN "
+                f"{column} {definition}"
+            )
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS chat_state (
@@ -124,6 +146,29 @@ def init_db():
             history_loaded INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # Миграция состояния, если база была создана старой версией.
+    state_columns = {
+        row["name"]
+        for row in db.execute(
+            "PRAGMA table_info(chat_state)"
+        ).fetchall()
+    }
+
+    state_required = {
+        "last_incoming_at": "TEXT",
+        "last_outgoing_at": "TEXT",
+        "last_followup_at": "TEXT",
+        "last_first_message_at": "TEXT",
+        "history_loaded": "INTEGER NOT NULL DEFAULT 0",
+    }
+
+    for column, definition in state_required.items():
+        if column not in state_columns:
+            db.execute(
+                f"ALTER TABLE chat_state ADD COLUMN "
+                f"{column} {definition}"
+            )
 
     db.commit()
 
