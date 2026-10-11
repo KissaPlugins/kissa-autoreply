@@ -866,7 +866,10 @@ async def openrouter_request(
             response.raise_for_status()
 
         data = response.json()
-
+   log.info(
+    "OpenRouter response: %s",
+    str(data)[:2500],
+)
     choices = data.get("choices") or []
 
     if not choices:
