@@ -352,7 +352,7 @@ async def generate_reply(chat_id, incoming_text):
     if not recent or recent[-1]["sender"] != "user" or recent[-1]["text"] != incoming_text:
         messages.append({"role": "user", "content": incoming_text})
 
-      answer = await openrouter_request(messages, max_tokens=60)
+answer = await openrouter_request(messages, max_tokens=60)
     # Первый фильтр: подозрительный текст не отправляется.
     if not looks_like_reasoning(answer):
         return answer[:2500].strip()
