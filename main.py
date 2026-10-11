@@ -18,6 +18,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeSticker,
     DocumentAttributeAnimated,
+    User,
 )
 
 # ==================================================
@@ -698,14 +699,22 @@ def get_chat_lock(chat_id):
 # ==================================================
 
 async def handle_incoming(event):
+    # Только личные сообщения от реальных пользователей. Не отвечаем ботам,
+    # группам, каналам, собственным сообщениям и системным сущностям.
     if not event.is_private or not event.chat_id:
+        return
+
+    sender = await event.get_sender()
+    if not isinstance(sender, User) or bool(getattr(sender, "bot", False)):
+        log.info("Входящее сообщение пропущено: отправитель не обычный пользователь")
+        return
+
+    me = await client.get_me()
+    if sender.id == me.id:
         return
 
     chat_id = int(event.chat_id)
     message = event.message
-
-    sender = await event.get_sender()
-    username = getattr(sender, "username", None)
 
     # Ограничение KISSA_ALLOWED_CHATS отключено:
     # отвечаем всем личным чатам.
@@ -811,6 +820,15 @@ async def on_outgoing(event):
     if not event.is_private or not event.chat_id:
         return
 
+    # Не выполнять команды и не записывать историю в чатах с ботами.
+    try:
+        chat = await event.get_chat()
+    except Exception:
+        log.exception("Не удалось проверить адресата исходящего сообщения")
+        return
+    if not isinstance(chat, User) or bool(getattr(chat, "bot", False)):
+        return
+
     text = (event.raw_text or "").strip()
     if not text:
         return
@@ -881,6 +899,12 @@ async def followup_loop():
 
                     try:
                         entity = await client.get_entity(chat_id)
+                        if not isinstance(entity, User) or bool(getattr(entity, "bot", False)):
+                            log.info("Follow-up пропущен: чат %s не является обычным пользователем", chat_id)
+                            continue
+                        me = await client.get_me()
+                        if entity.id == me.id:
+                            continue
                         messages = await build_context(chat_id)
                         messages.append({
                             "role": "user",
@@ -939,6 +963,13 @@ async def first_message_loop():
                         else:
                             entity = await client.get_entity(target)
 
+                        # Первое сообщение разрешено только обычным пользователям.
+                        if not isinstance(entity, User) or bool(getattr(entity, "bot", False)):
+                            log.info("Первое сообщение пропущено: %s не обычный пользователь", target)
+                            continue
+                        me = await client.get_me()
+                        if entity.id == me.id:
+                            continue
                         chat_id = int(getattr(entity, "id", 0))
                         if not chat_id:
                             continue
@@ -998,7 +1029,7 @@ async def main():
 
     log.info("Запуск Kissa AI AutoReply")
     log.info("Модель OpenRouter: %s", MODEL)
-    log.info("Автоответы: все личные чаты; список KISSA_ALLOWED_CHATS для входящих не применяется")
+    log.info("Автоответы: только личные чаты с обычными пользователями; боты и группы игнорируются")
 
     await client.start()
     me = await client.get_me()
