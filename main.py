@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import base64
 import tempfile
+import hmac
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,6 +47,10 @@ FOLLOWUP_ENABLED = (
 FIRST_MESSAGE_ENABLED = (
     os.getenv("FIRST_MESSAGE_ENABLED", "false").lower() == "true"
 )
+
+CONTROL_TOKEN = os.getenv("KISSA_CONTROL_TOKEN", "").strip()
+CONTROL_PORT = int(os.getenv("PORT", os.getenv("KISSA_CONTROL_PORT", "8080")))
+AI_ENABLED = os.getenv("KISSA_AI_ENABLED", "true").lower() == "true"
 
 FOLLOWUP_HOURS = int(os.getenv("FOLLOWUP_HOURS", "4"))
 FOLLOWUP_COOLDOWN_HOURS = int(
@@ -702,6 +707,8 @@ def get_chat_lock(chat_id):
 # ==================================================
 
 async def handle_incoming(event):
+    if not AI_ENABLED:
+        return
     # Только личные сообщения от реальных пользователей. Не отвечаем ботам,
     # группам, каналам, собственным сообщениям и системным сущностям.
     if not event.is_private or not event.chat_id:
@@ -843,6 +850,9 @@ async def handle_incoming(event):
 
             if is_generic_bad_reply(answer):
                 answer = "Извини, отвечу по сути, а не шаблоном."
+            if not AI_ENABLED:
+                log.info("Ответ отменён: ИИ выключен во время генерации")
+                return
             sent = await event.respond(answer[:MAX_MESSAGE_CHARS])
 
             if sent:
@@ -869,6 +879,102 @@ async def handle_incoming(event):
 @client.on(events.NewMessage(incoming=True))
 async def on_incoming(event):
     await handle_incoming(event)
+
+# ==================================================
+# ЗАЩИЩЁННОЕ УПРАВЛЕНИЕ И ПРОВЕРКА СОСТОЯНИЯ
+# ==================================================
+
+async def _control_reply(writer, status, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 500: "Internal Server Error"}.get(status, "OK")
+    headers = (
+        f"HTTP/1.1 {status} {reason}\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    writer.write(headers + body)
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def _control_client(reader, writer):
+    global AI_ENABLED
+    try:
+        raw_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        if len(raw_head) > 8192:
+            await _control_reply(writer, 400, {"ok": False, "error": "headers_too_large"})
+            return
+        lines = raw_head.decode("iso-8859-1").split("\r\n")
+        parts = lines[0].split()
+        if len(parts) != 3:
+            await _control_reply(writer, 400, {"ok": False, "error": "bad_request"})
+            return
+        method, path, _ = parts
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        if not CONTROL_TOKEN:
+            await _control_reply(writer, 500, {"ok": False, "error": "control_token_not_configured"})
+            return
+        if not hmac.compare_digest(headers.get("authorization", ""), "Bearer " + CONTROL_TOKEN):
+            await _control_reply(writer, 401, {"ok": False, "error": "unauthorized"})
+            return
+        if method == "GET" and path == "/status":
+            await _control_reply(writer, 200, {
+                "ok": True, "server": "online", "ai_enabled": AI_ENABLED,
+                "telegram_connected": bool(client.is_connected()), "model": MODEL
+            })
+            return
+        if method != "POST" or path != "/control":
+            await _control_reply(writer, 404, {"ok": False, "error": "not_found"})
+            return
+        try:
+            length = int(headers.get("content-length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > 1024:
+            await _control_reply(writer, 400, {"ok": False, "error": "invalid_content_length"})
+            return
+        body = await asyncio.wait_for(reader.readexactly(length), timeout=5) if length else b"{}"
+        data = json.loads(body.decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+            await _control_reply(writer, 400, {"ok": False, "error": "expected_boolean_enabled"})
+            return
+        AI_ENABLED = data["enabled"]
+        log.info("Состояние ИИ изменено через панель: %s", "ВКЛ" if AI_ENABLED else "ВЫКЛ")
+        await _control_reply(writer, 200, {
+            "ok": True, "server": "online", "ai_enabled": AI_ENABLED,
+            "telegram_connected": bool(client.is_connected()), "model": MODEL
+        })
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, UnicodeDecodeError, ValueError):
+        try:
+            await _control_reply(writer, 400, {"ok": False, "error": "invalid_request"})
+        except Exception:
+            pass
+    except Exception:
+        log.exception("Ошибка control API")
+        try:
+            await _control_reply(writer, 500, {"ok": False, "error": "internal_error"})
+        except Exception:
+            pass
+
+
+async def start_control_api():
+    if not CONTROL_TOKEN:
+        log.warning("KISSA_CONTROL_TOKEN не задан: API статуса и переключения не запущен")
+        return None
+    server = await asyncio.start_server(_control_client, "0.0.0.0", CONTROL_PORT)
+    log.info("Control API запущен на порту %s", CONTROL_PORT)
+    return server
+
 
 
 # ==================================================
@@ -1091,6 +1197,7 @@ async def main():
     log.info("Модель OpenRouter: %s", MODEL)
     log.info("Автоответы: только личные чаты с обычными пользователями; боты и группы игнорируются")
 
+    control_server = await start_control_api()
     await client.start()
     me = await client.get_me()
 
@@ -1106,6 +1213,9 @@ async def main():
     try:
         await client.run_until_disconnected()
     finally:
+        if control_server is not None:
+            control_server.close()
+            await control_server.wait_closed()
         for task in tasks:
             task.cancel()
 
