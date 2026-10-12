@@ -1099,13 +1099,9 @@ async def main():
         getattr(me, "username", None) or me.id,
     )
 
+    # Автоматические исходящие сообщения отключены:
+    # followup_loop() и first_message_loop() больше не запускаются.
     tasks = []
-
-    if FOLLOWUP_ENABLED:
-        tasks.append(asyncio.create_task(followup_loop()))
-
-    if FIRST_MESSAGE_ENABLED:
-        tasks.append(asyncio.create_task(first_message_loop()))
 
     try:
         await client.run_until_disconnected()
