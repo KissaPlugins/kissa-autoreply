@@ -131,6 +131,15 @@ def init_db():
             )
 
     db.execute("""
+        CREATE TABLE IF NOT EXISTS contact_facts (
+            chat_id INTEGER NOT NULL,
+            fact_key TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (chat_id, fact_key)
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS chat_state (
             chat_id INTEGER PRIMARY KEY,
             last_incoming_at TEXT,
@@ -410,16 +419,19 @@ async def sync_recent_history(entity, chat_id):
 # ==================================================
 
 def is_ignored_media(message):
-    # GIF пропускаем, но стикеры больше не игнорируются.
     document = getattr(message, "document", None)
     if not document:
         return False
     attributes = getattr(document, "attributes", []) or []
+    # Не пропускаем стикеры: ниже они отправляются в vision-модель.
+    is_sticker = any(isinstance(attr, DocumentAttributeSticker) for attr in attributes)
+    if is_sticker:
+        return False
+    if any(isinstance(attr, DocumentAttributeAnimated) for attr in attributes):
+        return True
     mime = (getattr(message.file, "mime_type", None) or "").lower()
     name = (getattr(message.file, "name", None) or "").lower()
-    is_sticker = any(isinstance(attr, DocumentAttributeSticker) for attr in attributes)
-    is_animated = any(isinstance(attr, DocumentAttributeAnimated) for attr in attributes)
-    return (not is_sticker) and (is_animated or mime == "image/gif" or name.endswith(".gif"))
+    return mime == "image/gif" or name.endswith(".gif")
 
 
 async def download_media_bytes(message):
@@ -475,6 +487,28 @@ async def photo_to_content(message):
     except Exception:
         log.exception("Ошибка обработки фотографии")
         return None
+
+
+async def sticker_to_content(message):
+    """Decode static stickers and video stickers to an image for vision."""
+    data = await download_media_bytes(message)
+    if not data:
+        return None
+    try:
+        frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            url = encode_frame(frame)
+            if url:
+                return {"type": "image_url", "image_url": {"url": url}}
+    except Exception:
+        log.exception("Ошибка обработки статичного стикера")
+    mime = (getattr(message.file, "mime_type", None) or "").lower()
+    name = (getattr(message.file, "name", None) or "").lower()
+    if mime.startswith("video/") or name.endswith((".webm", ".mp4")):
+        frames = await video_to_content(message)
+        return frames[0] if frames else None
+    # TGS-векторные анимации требуют отдельного рендерера.
+    return None
 
 
 async def video_to_content(message):
@@ -545,6 +579,19 @@ async def prepare_incoming_content(message):
 
     if not message.media:
         return (text[:1800], text) if text else (None, None)
+
+    document = getattr(message, "document", None)
+    attributes = (getattr(document, "attributes", []) or []) if document else []
+    is_sticker = any(isinstance(attr, DocumentAttributeSticker) for attr in attributes)
+    if is_sticker:
+        image_part = await sticker_to_content(message)
+        if not image_part:
+            return None, None
+        prompt = text or (
+            "Определи, что изображено на стикере, и ответь естественно с учётом "
+            "его смысла и контекста переписки."
+        )
+        return [{"type": "text", "text": prompt[:1800]}, image_part], "[Стикер]" + (": " + text if text else "")
 
     if message.photo:
         image_part = await photo_to_content(message)
@@ -666,7 +713,20 @@ async def build_context(chat_id):
         else:
             history.append({"role": role, "content": text[:1800]})
 
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    async with db_lock:
+        fact_rows = db.execute(
+            "SELECT fact_key, fact_value FROM contact_facts WHERE chat_id = ? "
+            "ORDER BY updated_at DESC LIMIT 40", (chat_id,)
+        ).fetchall()
+    if fact_rows:
+        facts_text = "\n".join(f"- {row['fact_key']}: {row['fact_value']}" for row in fact_rows)
+        system_text = SYSTEM_PROMPT + (
+            "\n\nДОЛГОВРЕМЕННЫЕ ФАКТЫ О СОБЕСЕДНИКЕ (используй уместно, "
+            "не перечисляй без повода):\n" + facts_text
+        )
+    else:
+        system_text = SYSTEM_PROMPT
+    return [{"role": "system", "content": system_text}] + history
 
 
 # ==================================================
@@ -762,6 +822,46 @@ def get_chat_lock(chat_id):
     if chat_id not in chat_locks:
         chat_locks[chat_id] = asyncio.Lock()
     return chat_locks[chat_id]
+
+
+async def update_contact_facts(chat_id, incoming_text, outgoing_text):
+    """Persist explicit, useful, non-sensitive facts about a contact."""
+    if not incoming_text or incoming_text.startswith(("[Фото]", "[Видео]", "[Стикер]")):
+        return
+    prompt = (
+        "Извлеки только явно сообщённые устойчивые факты о собеседнике для будущего "
+        "общения: интересы, предпочтения, учёба/работа, планы, имя/обращение и пожелания "
+        "к стилю ответов. Не сохраняй догадки, разовые эмоции, оскорбления, пароли, "
+        "ключи, адреса, телефоны, медицинские/интимные/точные финансовые сведения "
+        "или данные третьих лиц. Если фактов нет, верни []. Строгий JSON-массив "
+        "объектов {key,value}, максимум 5.\\n"
+        f"Сообщение собеседника: {incoming_text[:1200]}\\nОтвет: {outgoing_text[:800]}"
+    )
+    try:
+        raw = await openrouter_request([
+            {"role": "system", "content": "Извлекай факты осторожно, ничего не выдумывай."},
+            {"role": "user", "content": prompt},
+        ], max_tokens=250)
+        facts = json.loads(raw)
+        if not isinstance(facts, list):
+            return
+        async with db_lock:
+            for item in facts[:5]:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "")).strip()[:80]
+                value = str(item.get("value", "")).strip()[:400]
+                if key and value:
+                    db.execute(
+                        """INSERT INTO contact_facts(chat_id, fact_key, fact_value, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(chat_id, fact_key) DO UPDATE SET
+                        fact_value=excluded.fact_value, updated_at=excluded.updated_at""",
+                        (int(chat_id), key, value, now_iso()),
+                    )
+            db.commit()
+    except Exception:
+        log.exception("Не удалось обновить долговременные факты чата %s", chat_id)
 
 
 # ==================================================
@@ -941,6 +1041,8 @@ async def handle_incoming(event):
                     for item in messages[-12:]
                 ),
             ))
+            if sent:
+                asyncio.create_task(update_contact_facts(chat_id, stored_text or "", answer))
             log.info("Ответ отправлен в чат %s", chat_id)
 
         except httpx.HTTPStatusError as exc:
