@@ -52,6 +52,13 @@ CONTROL_TOKEN = os.getenv("KISSA_CONTROL_TOKEN", "").strip()
 CONTROL_PORT = int(os.getenv("PORT", os.getenv("KISSA_CONTROL_PORT", "8080")))
 AI_ENABLED = os.getenv("KISSA_AI_ENABLED", "true").lower() == "true"
 
+# Режим ответа: natural, friendly, serious, funny или educational.
+REPLY_STYLE = os.getenv("KISSA_REPLY_STYLE", "natural").strip().lower()
+VALID_REPLY_STYLES = {"natural", "friendly", "serious", "funny", "educational"}
+if REPLY_STYLE not in VALID_REPLY_STYLES:
+    log.warning("Неизвестный KISSA_REPLY_STYLE=%r; используется natural", REPLY_STYLE)
+    REPLY_STYLE = "natural"
+
 FOLLOWUP_HOURS = int(os.getenv("FOLLOWUP_HOURS", "4"))
 FOLLOWUP_COOLDOWN_HOURS = int(
     os.getenv("FOLLOWUP_COOLDOWN_HOURS", "24")
@@ -726,6 +733,20 @@ async def build_context(chat_id):
         )
     else:
         system_text = SYSTEM_PROMPT
+    style_instructions = {
+        "natural": "Стиль: естественный, как в обычной переписке; длина ответа соответствует сообщению.",
+        "friendly": "Стиль: дружелюбный, тёплый и внимательный, без навязчивости.",
+        "serious": "Стиль: спокойный, серьёзный и точный; минимум шуток и сленга.",
+        "funny": "Стиль: допускай уместный юмор и лёгкую иронию, но не шути в ответ на боль, тревогу или серьёзную просьбу.",
+        "educational": "Стиль: объясняй понятно и по шагам; для учебных задач используй структуру «Дано / Найти / Решение / Ответ», если она подходит предмету."
+    }
+    system_text += (
+        "\\n\\nАКТИВНЫЙ РЕЖИМ: " + REPLY_STYLE + "\\n"
+        + style_instructions[REPLY_STYLE]
+        + "\\nПеред отправкой проверь: ответ относится к последней реплике, "
+        "не повторяет предыдущий ответ без причины, не путает владельца и собеседника, "
+        "не придумывает факты и использует подходящую длину. Если это не так — исправь."
+    )
     return [{"role": "system", "content": system_text}] + history
 
 
@@ -903,6 +924,20 @@ async def handle_incoming(event):
 
     async with get_chat_lock(chat_id):
         try:
+            # Защита от повторной обработки одного и того же Telegram-события.
+            # Проверяем до сохранения: повторное событие не должно запускать новую генерацию.
+            async with db_lock:
+                already_processed = db.execute(
+                    "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?",
+                    (int(chat_id), int(message.id)),
+                ).fetchone()
+            if already_processed:
+                log.info(
+                    "Повторное входящее событие пропущено: чат %s, сообщение %s",
+                    chat_id, message.id,
+                )
+                return
+
             await save_message_async(
                 chat_id, message, outgoing=False, text_override=stored_text
             )
