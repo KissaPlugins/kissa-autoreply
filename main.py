@@ -160,6 +160,14 @@ def init_db():
                 f"ALTER TABLE chat_state ADD COLUMN {column} {definition}"
             )
 
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_facts (
+            chat_id INTEGER PRIMARY KEY,
+            facts TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
     db.commit()
 
 
@@ -264,6 +272,51 @@ async def save_message_async(
         store_message(chat_id, message, outgoing, text_override)
 
 
+async def get_chat_facts(chat_id):
+    async with db_lock:
+        row = db.execute(
+            "SELECT facts FROM chat_facts WHERE chat_id = ?",
+            (int(chat_id),),
+        ).fetchone()
+    return (row["facts"] or "").strip() if row else ""
+
+
+async def update_chat_facts(chat_id, recent_messages):
+    """Extract only stable, useful facts from a chat and persist them in SQLite."""
+    try:
+        existing = await get_chat_facts(chat_id)
+        prompt = (
+            "Обнови долговременную память об одном собеседнике. Используй только факты, "
+            "которые прямо сообщены в переписке; не делай догадок о личности, здоровье, "
+            "политике, религии, сексуальности или других чувствительных характеристиках. "
+            "Не сохраняй пароли, токены, адреса, телефоны, финансовые данные и секреты. "
+            "Храни только устойчивые предпочтения общения, интересы, текущие проекты/цели, "
+            "важные несекретные факты, которые помогут отвечать уместнее. Удали устаревшие "
+            "или опровергнутые сведения. Верни краткий список на русском, максимум 1200 "
+            "символов; если полезных фактов нет, верни пустую строку. Только память, без пояснений.\n\n"
+            "Текущая память:\n" + (existing or "(пусто)") +
+            "\n\nПоследние реплики:\n" + str(recent_messages)[-5000:]
+        )
+        updated = await openrouter_request([
+            {"role": "system", "content": "Ты аккуратный редактор долговременной памяти. Не выдумывай."},
+            {"role": "user", "content": prompt},
+        ])
+        updated = (updated or "").strip()[:1200]
+        if not updated:
+            return
+        async with db_lock:
+            db.execute(
+                """INSERT INTO chat_facts(chat_id, facts, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                   facts=excluded.facts, updated_at=excluded.updated_at""",
+                (int(chat_id), updated, now_iso()),
+            )
+            db.commit()
+    except Exception:
+        log.exception("Не удалось обновить долговременную память чата %s", chat_id)
+
+
 # ==================================================
 # ИСТОРИЯ ПЕРЕПИСКИ
 # ==================================================
@@ -357,21 +410,16 @@ async def sync_recent_history(entity, chat_id):
 # ==================================================
 
 def is_ignored_media(message):
+    # GIF пропускаем, но стикеры больше не игнорируются.
     document = getattr(message, "document", None)
     if not document:
         return False
-
     attributes = getattr(document, "attributes", []) or []
-    if any(
-        isinstance(attr, (DocumentAttributeSticker, DocumentAttributeAnimated))
-        for attr in attributes
-    ):
-        return True
-
     mime = (getattr(message.file, "mime_type", None) or "").lower()
     name = (getattr(message.file, "name", None) or "").lower()
-
-    return mime == "image/gif" or name.endswith(".gif")
+    is_sticker = any(isinstance(attr, DocumentAttributeSticker) for attr in attributes)
+    is_animated = any(isinstance(attr, DocumentAttributeAnimated) for attr in attributes)
+    return (not is_sticker) and (is_animated or mime == "image/gif" or name.endswith(".gif"))
 
 
 async def download_media_bytes(message):
@@ -490,10 +538,10 @@ async def video_to_content(message):
 
 
 async def prepare_incoming_content(message):
-    if is_ignored_media(message):
-        return None, None
-
     text = (message.raw_text or "").strip()
+    document = getattr(message, "document", None)
+    attributes = getattr(document, "attributes", []) or [] if document else []
+    sticker_attr = next((a for a in attributes if isinstance(a, DocumentAttributeSticker)), None)
 
     if not message.media:
         return (text[:1800], text) if text else (None, None)
@@ -502,38 +550,49 @@ async def prepare_incoming_content(message):
         image_part = await photo_to_content(message)
         if not image_part:
             return None, None
+        prompt = text or "Проанализируй фотографию и ответь по её содержанию."
+        return [{"type": "text", "text": prompt[:1800]}, image_part], "[Фото]" + (": " + text if text else "")
 
+    # Статические стикеры (обычно WebP) отправляем модели как изображение.
+    # Для анимированных TGS сохраняем emoji/подпись, если декодирование недоступно.
+    if sticker_attr is not None:
+        sticker_bytes = await download_media_bytes(message)
+        image_part = None
+        if sticker_bytes:
+            try:
+                arr = np.frombuffer(sticker_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+                if frame is not None:
+                    if len(frame.shape) == 3 and frame.shape[2] == 4:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    url = encode_frame(frame)
+                    if url:
+                        image_part = {"type": "image_url", "image_url": {"url": url}}
+            except Exception:
+                log.exception("Не удалось декодировать стикер")
+        emoji = getattr(sticker_attr, "alt", "") or ""
         prompt = text or (
-            "Посмотри на фотографию и ответь естественно "
-            "с учётом того, что на ней изображено."
+            "Собеседник прислал стикер. Определи его видимое выражение/смысл "
+            "и ответь естественно в контексте переписки. Не выдумывай детали."
         )
-        return [
-            {"type": "text", "text": prompt[:1800]},
-            image_part,
-        ], "[Фото]" + (": " + text if text else "")
+        parts = [{"type": "text", "text": (prompt + (" Эмодзи стикера: " + emoji if emoji else ""))[:1800]}]
+        if image_part:
+            parts.append(image_part)
+        return parts, "[Стикер" + ((" " + emoji) if emoji else "") + "]" + (": " + text if text else "")
+
+    if is_ignored_media(message):
+        return None, None
 
     mime = (getattr(message.file, "mime_type", None) or "").lower()
     name = (getattr(message.file, "name", None) or "").lower()
-
-    is_video = mime.startswith("video/") or name.endswith(
-        (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv")
-    )
-
+    is_video = mime.startswith("video/") or name.endswith((".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"))
     if is_video:
         frames = await video_to_content(message)
         if not frames:
             return None, None
+        prompt = text or "Проанализируй кадры видео, ответь по существу и не придумывай деталей."
+        return [{"type": "text", "text": prompt[:1800]}, *frames], "[Видео]" + (": " + text if text else "")
 
-        prompt = text or (
-            "Проанализируй кадры этого видео. Ответь по существу "
-            "и не придумывай детали, которых не видно."
-        )
-        return [
-            {"type": "text", "text": prompt[:1800]},
-            *frames,
-        ], "[Видео]" + (": " + text if text else "")
-
-    # Голосовые, аудио, документы и неподдерживаемые файлы пропускаем.
     return None, None
 
 
@@ -757,6 +816,12 @@ async def handle_incoming(event):
             await sync_recent_history(event.input_chat, chat_id)
 
             messages = await build_context(chat_id)
+            persistent_facts = await get_chat_facts(chat_id)
+            if persistent_facts:
+                messages.insert(1, {
+                    "role": "system",
+                    "content": "Долговременная память об этом собеседнике (используй только если уместно, факты могут устареть):\\n" + persistent_facts,
+                })
 
             # Последнее сообщение заменяем текстом вместе с фото/кадрами,
             # чтобы модель получила именно текущее входящее сообщение.
@@ -867,6 +932,15 @@ async def handle_incoming(event):
                         last_followup_at=None,
                     )
 
+            # Обновляем факты после ответа; сбой памяти не должен мешать переписке.
+            asyncio.create_task(update_chat_facts(
+                chat_id,
+                "\\n".join(
+                    ("Собеседник: " if item.get("role") == "user" else "Владелец/ИИ: ")
+                    + (item.get("content") if isinstance(item.get("content"), str) else "[изображение/медиа]")
+                    for item in messages[-12:]
+                ),
+            ))
             log.info("Ответ отправлен в чат %s", chat_id)
 
         except httpx.HTTPStatusError as exc:
