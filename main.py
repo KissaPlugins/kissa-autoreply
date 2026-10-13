@@ -56,7 +56,7 @@ AI_ENABLED = os.getenv("KISSA_AI_ENABLED", "true").lower() == "true"
 REPLY_STYLE = os.getenv("KISSA_REPLY_STYLE", "natural").strip().lower()
 VALID_REPLY_STYLES = {"natural", "friendly", "serious", "funny", "educational"}
 if REPLY_STYLE not in VALID_REPLY_STYLES:
-    log.warning("Неизвестный KISSA_REPLY_STYLE=%r; используется natural", REPLY_STYLE)
+    logging.warning("Неизвестный KISSA_REPLY_STYLE=%r; используется natural", REPLY_STYLE)
     REPLY_STYLE = "natural"
 
 FOLLOWUP_HOURS = int(os.getenv("FOLLOWUP_HOURS", "4"))
@@ -741,9 +741,9 @@ async def build_context(chat_id):
         "educational": "Стиль: объясняй понятно и по шагам; для учебных задач используй структуру «Дано / Найти / Решение / Ответ», если она подходит предмету."
     }
     system_text += (
-        "\\n\\nАКТИВНЫЙ РЕЖИМ: " + REPLY_STYLE + "\\n"
+        "\n\nАКТИВНЫЙ РЕЖИМ: " + REPLY_STYLE + "\n"
         + style_instructions[REPLY_STYLE]
-        + "\\nПеред отправкой проверь: ответ относится к последней реплике, "
+        + "\nПеред отправкой проверь: ответ относится к последней реплике, "
         "не повторяет предыдущий ответ без причины, не путает владельца и собеседника, "
         "не придумывает факты и использует подходящую длину. Если это не так — исправь."
     )
@@ -855,8 +855,8 @@ async def update_contact_facts(chat_id, incoming_text, outgoing_text):
         "к стилю ответов. Не сохраняй догадки, разовые эмоции, оскорбления, пароли, "
         "ключи, адреса, телефоны, медицинские/интимные/точные финансовые сведения "
         "или данные третьих лиц. Если фактов нет, верни []. Строгий JSON-массив "
-        "объектов {key,value}, максимум 5.\\n"
-        f"Сообщение собеседника: {incoming_text[:1200]}\\nОтвет: {outgoing_text[:800]}"
+        "объектов {key,value}, максимум 5.\n"
+        f"Сообщение собеседника: {incoming_text[:1200]}\nОтвет: {outgoing_text[:800]}"
     )
     try:
         raw = await openrouter_request([
@@ -955,7 +955,7 @@ async def handle_incoming(event):
             if persistent_facts:
                 messages.insert(1, {
                     "role": "system",
-                    "content": "Долговременная память об этом собеседнике (используй только если уместно, факты могут устареть):\\n" + persistent_facts,
+                    "content": "Долговременная память об этом собеседнике (используй только если уместно, факты могут устареть):\n" + persistent_facts,
                 })
 
             # Последнее сообщение заменяем текстом вместе с фото/кадрами,
@@ -1070,7 +1070,7 @@ async def handle_incoming(event):
             # Обновляем факты после ответа; сбой памяти не должен мешать переписке.
             asyncio.create_task(update_chat_facts(
                 chat_id,
-                "\\n".join(
+                "\n".join(
                     ("Собеседник: " if item.get("role") == "user" else "Владелец/ИИ: ")
                     + (item.get("content") if isinstance(item.get("content"), str) else "[изображение/медиа]")
                     for item in messages[-12:]
